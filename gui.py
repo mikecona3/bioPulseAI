@@ -1,7 +1,9 @@
 """
 gui.py — Health Anomaly Detector — macOS GUI
 
-Drag your Apple Health export.zip onto the drop zone.  The app will:
+Drag a health export onto the drop zone — Apple Health, Google Takeout
+(Google Fit / Fitbit), Health Connect, or a Fitbit account archive.
+The app will:
   1. Parse the export (background thread — UI stays responsive)
   2. Run Layer 1: StatisticalScreener → show flagged anomalies instantly
   3. Optional: click "Analyze with AI" → run Layer 2: LLM interpretation
@@ -9,7 +11,7 @@ Drag your Apple Health export.zip onto the drop zone.  The app will:
 Requires:  pip install tkinterdnd2 anthropic
 """
 
-import json
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -22,8 +24,8 @@ try:
 except ImportError:
     _HAS_DND = False
 
-from vitals_monitor import StatisticalScreener
-from adapters.apple_health import AppleHealthAdapter
+from vitals_monitor import SEVERITY_ORDER, StatisticalScreener
+from adapters import load_export
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +80,13 @@ class _DropZone(tk.Canvas):
                               outline=bc, width=2, fill=bg, dash=(10, 5))
         self.create_text(w // 2, h // 2 - 18, text="📦",
                          font=(_SF, 30), fill=tc, anchor="center")
-        label = "Release to analyse" if self._hovering else "Drop Apple Health export.zip here"
+        label = "Release to analyse" if self._hovering else "Drop your health export here"
         self.create_text(w // 2, h // 2 + 16,
                          text=label, font=(_SF_D, 13, "bold"),
                          fill=tc, anchor="center")
         if not self._hovering:
             self.create_text(w // 2, h // 2 + 38,
-                             text="iPhone  →  Health  →  Profile  →  Export All Health Data",
+                             text="Apple Health  •  Google Takeout (Fit / Fitbit)  •  Health Connect  •  Fitbit archive",
                              font=(_SF, 10), fill=TEXT_SEC, anchor="center")
         if not _HAS_DND:
             self.create_text(w // 2, h - 14,
@@ -97,16 +99,17 @@ class _DropZone(tk.Canvas):
     def _drop(self, event):
         self._hovering = False
         self._draw()
-        self._callback(event.data.strip().strip("{}"))
+        # Several files can be dropped at once (e.g. a Takeout split into parts)
+        self._callback(list(self.tk.splitlist(event.data)))
 
     def _click(self, _):
         from tkinter import filedialog
-        p = filedialog.askopenfilename(
-            title="Select Apple Health export",
-            filetypes=[("ZIP archive", "*.zip"), ("XML file", "*.xml")],
+        paths = filedialog.askopenfilenames(
+            title="Select health export",
+            filetypes=[("Health export", "*.zip *.xml *.db"), ("All files", "*")],
         )
-        if p:
-            self._callback(p)
+        if paths:
+            self._callback(list(paths))
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +167,13 @@ class _AnomalyTable(tk.Frame):
             self.tree.delete(i)
         self.header.config(text="")
 
-    def populate(self, n_raw: int, n_records: int, anomalies: list):
+    def populate(self, n_raw: int, n_records: int, anomalies: list, sources: list):
         self.clear()
 
         highs  = sum(1 for a in anomalies if a.severity == "high")
         meds   = sum(1 for a in anomalies if a.severity == "medium")
         parts  = [
+            " + ".join(sources),
             f"{n_raw:,} readings  →  {n_records:,} hourly snapshots",
             f"{len(anomalies)} anomal{'y' if len(anomalies) == 1 else 'ies'} flagged",
         ]
@@ -184,8 +188,8 @@ class _AnomalyTable(tk.Frame):
             return
 
         sorted_a = sorted(anomalies,
-                          key=lambda a: (0 if a.severity=="high" else 1 if a.severity=="medium" else 2,
-                                         -(a.z_score or 0)))
+                          key=lambda a: (SEVERITY_ORDER.get(a.severity, 3),
+                                         -abs(a.z_score or 0)))
         for a in sorted_a:
             badge  = {"high": "🔴 HIGH", "medium": "🟡 MEDIUM", "low": "⚪ LOW"}.get(a.severity, a.severity)
             z_str  = f"{a.z_score:+.1f} σ" if a.z_score is not None else "—"
@@ -262,6 +266,10 @@ class _LLMPanel(tk.Frame):
         self.btn.config(state="normal", text="🤖  Analyze with AI")
         lines = []
 
+        reviewed, total = result.get("anomalies_reviewed"), result.get("anomalies_total")
+        if reviewed is not None and reviewed < total:
+            lines += [f"Claude reviewed the {reviewed} most severe of {total} anomalies in detail.", ""]
+
         summary = result.get("overall_summary", "")
         if summary:
             lines += ["── Overall Summary ──────────────────────────", summary, ""]
@@ -288,7 +296,7 @@ class _LLMPanel(tk.Frame):
 
     def show_error(self, msg: str):
         self.btn.config(state="normal", text="🤖  Analyze with AI")
-        self._set_text(f"❌ LLM error: {msg}\n\nCheck that ANTHROPIC_API_KEY is set.")
+        self._set_text(f"❌ {msg}")
 
     def _set_text(self, text: str):
         self.result_box.config(state="normal")
@@ -312,7 +320,25 @@ class HealthMonitorApp:
 
         self._records   = []
         self._anomalies = []
+        self._busy      = False
+        # Worker threads must not touch Tk directly — they queue callbacks
+        # that _drain_ui_queue runs on the main thread
+        self._ui_queue  = queue.Queue()
         self._build_ui()
+        self.root.after(100, self._drain_ui_queue)
+
+    def _post(self, fn, *args):
+        """Schedule fn(*args) on the Tk main thread (safe from any thread)."""
+        self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            fn(*args)
+        self.root.after(100, self._drain_ui_queue)
 
     def _build_ui(self):
         # Header
@@ -342,7 +368,7 @@ class HealthMonitorApp:
         self.llm_panel.pack(fill="both", expand=False, padx=28, pady=(4, 6))
 
         # Status bar
-        self._status = tk.StringVar(value="Ready — drop an export.zip to begin")
+        self._status = tk.StringVar(value="Ready — drop a health export to begin")
         tk.Label(self.root, textvariable=self._status,
                  font=(_SF, 11), bg=STATUS_BG, fg=TEXT_SEC,
                  anchor="w", padx=14, pady=6).pack(fill="x", side="bottom")
@@ -351,39 +377,42 @@ class HealthMonitorApp:
     # File processing (Layer 1)
     # ------------------------------------------------------------------
 
-    def _on_file(self, path: str):
-        if not path.lower().endswith((".zip", ".xml")):
-            self._status.set("⚠  Please drop an Apple Health export.zip or export.xml")
+    def _on_file(self, paths: list):
+        if self._busy:
+            self._status.set("⏳  Still working on the current file — please wait")
             return
-        self._status.set(f"⏳  Loading {Path(path).name} ...")
+        names = ", ".join(Path(p).name for p in paths)
+        self._status.set(f"⏳  Loading {names} ...")
         self.table.clear()
         self.llm_panel.enable([])
-        threading.Thread(target=self._process, args=(path,), daemon=True).start()
+        self._anomalies = []
+        self._busy = True
+        threading.Thread(target=self._process, args=(paths,), daemon=True).start()
 
-    def _process(self, path: str):
+    def _process(self, paths: list):
         try:
-            adapter = AppleHealthAdapter(path)
-
             def tick(n):
-                self.root.after(0, self._status.set,
-                                f"⏳  Parsed {n:,} readings so far ...")
+                self._post(self._status.set, f"⏳  Read {n:,} readings so far ...")
 
-            records, n_raw = adapter.load(progress_callback=tick)
-            screener       = StatisticalScreener(records)
-            anomalies      = screener.screen()
+            records, n_raw, sources = load_export(paths, progress_callback=tick)
+            anomalies = StatisticalScreener(records).screen()
 
-            self._records   = records
-            self._anomalies = anomalies
+            self._post(self._show_layer1, n_raw, records, anomalies, sources)
 
-            self.root.after(0, self._show_layer1, n_raw, records, anomalies)
-
-        except FileNotFoundError as e:
-            self.root.after(0, self._status.set, f"❌  {e}")
+        except (FileNotFoundError, ValueError) as e:
+            self._post(self._fail, f"❌  {e}")
         except Exception as e:
-            self.root.after(0, self._status.set, f"❌  Error: {e}")
+            self._post(self._fail, f"❌  Error: {e}")
 
-    def _show_layer1(self, n_raw: int, records: list, anomalies: list):
-        self.table.populate(n_raw, len(records), anomalies)
+    def _fail(self, msg: str):
+        self._busy = False
+        self._status.set(msg)
+
+    def _show_layer1(self, n_raw: int, records: list, anomalies: list, sources: list):
+        self._busy      = False
+        self._records   = records
+        self._anomalies = anomalies
+        self.table.populate(n_raw, len(records), anomalies, sources)
         self.llm_panel.enable(anomalies)
         count = len(anomalies)
         self._status.set(
@@ -396,21 +425,23 @@ class HealthMonitorApp:
     # ------------------------------------------------------------------
 
     def _on_analyze(self):
-        if not self._anomalies:
+        if not self._anomalies or self._busy:
             return
         self.llm_panel.show_loading()
-        threading.Thread(target=self._run_llm, daemon=True).start()
+        threading.Thread(target=self._run_llm, args=(self._anomalies,), daemon=True).start()
 
-    def _run_llm(self):
+    def _run_llm(self, anomalies: list):
         try:
-            from health_anomaly_detector import LLMAnalyzer
-            analyzer = LLMAnalyzer()
-            result   = analyzer.analyze(self._anomalies)
-            self.root.after(0, self.llm_panel.show_result, result)
-            self.root.after(0, self._status.set, "✅  AI analysis complete")
+            from health_anomaly_detector import LLMAnalyzer, MissingCredentialsError
+            result = LLMAnalyzer().analyze(anomalies)
+            self._post(self.llm_panel.show_result, result)
+            self._post(self._status.set, "✅  AI analysis complete")
+        except MissingCredentialsError as e:
+            self._post(self.llm_panel.show_error, str(e))
+            self._post(self._status.set, "❌  AI analysis needs an Anthropic API key")
         except Exception as e:
-            self.root.after(0, self.llm_panel.show_error, str(e))
-            self.root.after(0, self._status.set, f"❌  AI error: {e}")
+            self._post(self.llm_panel.show_error, f"AI analysis failed: {e}")
+            self._post(self._status.set, f"❌  AI error: {e}")
 
     def run(self):
         if not _HAS_DND:

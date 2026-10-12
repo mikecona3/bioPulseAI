@@ -4,22 +4,15 @@ vitals_monitor.py  —  Layer 1: Statistical Pre-Screener
 Defines the shared data types (HealthRecord, Anomaly) used throughout the
 pipeline, and the StatisticalScreener that gates access to the LLM layer.
 
-Merged from:
-  • anom_llm.py           — HealthRecord, Anomaly, StatisticalScreener, combo rules
-  • vitals_monitor.py     — rolling baseline approach, get_summary() for the GUI
-
-Fixes applied from anom_llm.py:
-  • Removed unused google.generativeai import
-  • Removed wearable_api import (data now comes from adapters/)
-  • Added Optional type hints throughout
-  • Added baseline_mean / baseline_stdev / z_score fields to Anomaly
-    so the GUI table can show them without parsing the reason string
-  • get_summary() added for the GUI status strip
+Baselines are computed once over the whole dataset.  Hours where the person
+was exercising (a workout, or a burst of steps) are left out of the heart-rate
+and respiratory-rate baselines and skip the z-score check for those metrics,
+so ordinary workouts are not reported as anomalies.  Hard physiological bounds
+still apply to every hour.
 """
 
 import statistics
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
 from typing import Optional, Union
 
 
@@ -48,6 +41,7 @@ class HealthRecord:
     body_temperature:    Optional[float] = None   # °C
     skin_temp_variation: Optional[float] = None   # °C delta from baseline
     ecg_rhythm:          Optional[str]   = None   # e.g. "sinus", "afib"
+    active:              Optional[bool]  = None   # True if a workout overlapped this hour
 
 
 @dataclass
@@ -62,7 +56,11 @@ class Anomaly:
     # Optional — populated for z-score anomalies; None for hard-bounds / combo flags
     baseline_mean:   Optional[float] = None
     baseline_stdev:  Optional[float] = None
-    z_score:         Optional[float] = None
+    z_score:         Optional[float] = None   # signed: + above baseline, − below
+
+
+# Sort order for display: high first
+SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +102,10 @@ class StatisticalScreener:
     ZSCORE_THRESHOLD     = 2.5   # SDs from personal mean → flag
     MIN_BASELINE_RECORDS = 7     # minimum readings before z-score is trusted
 
+    # Metrics that rise naturally with exercise — no z-score check in active hours
+    ACTIVITY_SENSITIVE   = {"heart_rate", "respiratory_rate"}
+    ACTIVE_STEPS_PER_HOUR = 1000  # an hour with this many steps counts as active
+
     def __init__(self, records: list):
         self.records    = records
         self._baselines = self._compute_baselines()
@@ -116,6 +118,7 @@ class StatisticalScreener:
         """Run all checks and return every flagged Anomaly."""
         anomalies     = []
         records_dicts = [asdict(r) for r in self.records]
+        sleep_days    = set()   # sleep+hrv fires at most once per day
 
         for i, record in enumerate(self.records):
             # ±3-record context window passed to LLM for each anomaly
@@ -136,33 +139,41 @@ class StatisticalScreener:
                     ))
                     continue
 
+                if metric in self.ACTIVITY_SENSITIVE and self._is_active(record):
+                    continue
+
                 z = self._zscore(metric, value)
-                if z is not None and z >= self.ZSCORE_THRESHOLD:
+                if z is not None and abs(z) >= self.ZSCORE_THRESHOLD:
                     b        = self._baselines[metric]
-                    severity = "high" if z > 3.5 else "medium"
+                    severity = "high" if abs(z) > 3.5 else "medium"
                     anomalies.append(Anomaly(
                         metric=metric, value=value,
                         timestamp=record.timestamp,
                         reason=(
-                            f"Z-score {z:.1f}σ from personal mean "
+                            f"Z-score {z:+.1f}σ from personal mean "
                             f"(mean={b['mean']:.1f}, σ={b['stdev']:.1f})"
                         ),
                         severity=severity, context_window=context,
                         baseline_mean=round(b["mean"],  2),
                         baseline_stdev=round(b["stdev"], 2),
-                        z_score=round(min(z, 99.9), 2),
+                        z_score=round(max(min(z, 99.9), -99.9), 2),
                     ))
 
             # Multi-metric combo rules
             anomalies += self._check_hr_spo2(record, context)
-            anomalies += self._check_sleep_hrv(record, context)
+            day = record.timestamp[:10]
+            if day not in sleep_days:
+                found = self._check_sleep_hrv(record, context)
+                if found:
+                    sleep_days.add(day)
+                    anomalies += found
             anomalies += self._check_resp_spo2(record, context)
             anomalies += self._check_ecg(record, context)
 
         return anomalies
 
     def get_summary(self) -> dict:
-        """Per-metric baseline stats used by the GUI status strip."""
+        """Per-metric baseline stats (mean, stdev, count of readings used)."""
         return {
             metric: {
                 "mean":  round(b["mean"],  2),
@@ -176,15 +187,16 @@ class StatisticalScreener:
     # Private
     # ------------------------------------------------------------------
 
+    def _is_active(self, r: HealthRecord) -> bool:
+        return bool(r.active) or (r.steps or 0) >= self.ACTIVE_STEPS_PER_HOUR
+
     def _compute_baselines(self) -> dict:
-        metrics = list(self.HARD_BOUNDS.keys()) + [
-            "steps", "calories_burned", "sleep_hours", "blood_glucose"
-        ]
         baselines = {}
-        for m in metrics:
+        for m in self.HARD_BOUNDS:
             values = [
                 getattr(r, m) for r in self.records
                 if getattr(r, m, None) is not None
+                and not (m in self.ACTIVITY_SENSITIVE and self._is_active(r))
             ]
             if len(values) >= self.MIN_BASELINE_RECORDS:
                 stdev = statistics.stdev(values) if len(values) > 1 else 0.01
@@ -201,7 +213,7 @@ class StatisticalScreener:
         if metric not in self._baselines:
             return None
         b = self._baselines[metric]
-        return abs(value - b["mean"]) / b["stdev"]
+        return (value - b["mean"]) / b["stdev"]
 
     # Combo rules ──────────────────────────────────────────────────────
 
